@@ -1,7 +1,4 @@
-use std::{
-    fmt::Debug,
-    time::{Duration, SystemTime},
-};
+use std::{fmt::Debug, time::Duration};
 
 use anyhow::Context;
 use futures_util::{SinkExt, StreamExt};
@@ -28,8 +25,8 @@ pub struct XrplSocket {
 
 impl XrplSocket {
     pub async fn new(url: &str) -> anyhow::Result<XrplSocket> {
-        let (res_sender, res_receiver) = broadcast::channel(1000);
-        let (req_sender, mut req_receiver) = mpsc::channel(1000);
+        let (res_sender, res_receiver) = broadcast::channel(10);
+        let (req_sender, mut req_receiver) = mpsc::channel(10);
 
         let client = XrplSocket {
             res_receiver,
@@ -101,7 +98,6 @@ impl XrplSocket {
         let (out_sender, out_rec) = oneshot::channel::<XrplResponse<T>>();
 
         tokio::spawn(async move {
-            let now = SystemTime::now();
             let req_id = Uuid::new_v4().to_string();
             let req = req.to_string(&req_id);
             let send_res = sender.send(req).await;
@@ -128,10 +124,6 @@ impl XrplSocket {
                     if let Err(e) = res {
                         eprintln!("error sending message on out channel - \n {e:?}");
                     }
-                    match now.elapsed() {
-                        Ok(dur) => println!("execution took - {}", dur.as_millis()),
-                        _ => {}
-                    }
                     break;
                 }
             }
@@ -148,7 +140,7 @@ impl XrplSocket {
     ) -> anyhow::Result<Receiver<T>> {
         let sender = self.req_sender.clone();
         let mut receiver = self.res_receiver.resubscribe();
-        let (res_sender, res_receiver) = broadcast::channel::<T>(1000);
+        let (res_sender, res_receiver) = broadcast::channel::<T>(10);
 
         tokio::spawn(async move {
             let send_res = sender.send(req.to_string()).await;

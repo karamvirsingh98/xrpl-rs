@@ -4,6 +4,7 @@ version = "0.1.1"
 edition = "2021"
 authors=["Karamvir Singh"]
 description="multithreaded websocket client library for the xrp ledger"
+repository = "https://github.com/karamvirsingh98/xrpl-rs"
 license="MIT"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

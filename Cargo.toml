@@ -1,6 +1,6 @@
 [package]
 name = "xrpl"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors=["Karamvir Singh"]
 description="multithreaded websocket client library for the xrp ledger"

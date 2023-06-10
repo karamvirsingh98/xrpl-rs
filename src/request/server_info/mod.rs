@@ -1,11 +1,31 @@
 use serde_derive::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use uuid::Uuid;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+use super::{XrplRequest, XrplResponse};
+
+#[derive(Default, Serialize)]
+pub struct ServerInfoRequest;
+
+impl Into<Value> for ServerInfoRequest {
+    fn into(self) -> Value {
+        json!({
+            "command": "server_info",
+            "id": Uuid::new_v4().to_string()
+        })
+    }
+}
+
+impl XrplRequest for ServerInfoRequest {
+    type Response = XrplResponse<ServerInfoResult>;
+}
+
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfoResult {
     pub info: ServerInfo,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfo {
     pub build_version: String,
     pub complete_ledgers: String,
@@ -29,7 +49,7 @@ pub struct ServerInfo {
     pub validation_quorum: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfoValidatedLedger {
     pub age: i64,
     pub base_fee_xrp: f64,
@@ -39,13 +59,13 @@ pub struct ServerInfoValidatedLedger {
     pub seq: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfoLastClose {
     pub converge_time_s: f64,
     pub proposers: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfoStateAccounting {
     pub connected: ServerInfoStateAccount,
     pub disconnected: ServerInfoStateAccount,
@@ -54,7 +74,7 @@ pub struct ServerInfoStateAccounting {
     pub tracking: ServerInfoStateAccount,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ServerInfoStateAccount {
     pub duration_us: String,
     pub transitions: String,

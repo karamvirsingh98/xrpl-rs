@@ -1,86 +1,110 @@
-use std::{fmt::Debug, time::Duration};
+use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
 use futures_util::{SinkExt, StreamExt};
-use serde::{de::DeserializeOwned, Serialize};
+use serde_json::Value;
 use tokio::{
-    sync::{
-        broadcast::{self, Receiver},
-        mpsc, oneshot,
-    },
+    sync::{broadcast, mpsc, oneshot},
     time,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use uuid::Uuid;
+use tokio_util::sync::CancellationToken;
 
-use crate::types::{
-    request::{XrplRequest, XrplSubscriptionRequest},
-    response::XrplResponse,
-};
+use crate::request::XrplSubscription;
 
 pub struct XrplSocket {
-    res_receiver: broadcast::Receiver<String>,
-    req_sender: mpsc::Sender<String>,
+    receiver: broadcast::Receiver<String>,
+    sender: mpsc::Sender<String>,
+    timeout_dur: Option<i64>,
+    cancel: CancellationToken,
 }
 
 impl XrplSocket {
-    pub async fn new(url: &str) -> anyhow::Result<XrplSocket> {
-        let (res_sender, res_receiver) = broadcast::channel(10);
-        let (req_sender, mut req_receiver) = mpsc::channel(10);
+    pub async fn new(url: &str, timeout_dur: Option<i64>) -> anyhow::Result<XrplSocket> {
+        let (receiver_out, receiver) = broadcast::channel(1000);
+        let (sender, mut sender_in) = mpsc::channel(1000);
 
         let client = XrplSocket {
-            res_receiver,
-            req_sender,
+            receiver,
+            sender,
+            timeout_dur,
+            cancel: CancellationToken::new(),
         };
 
         let (stream, _) = connect_async(url)
             .await
             .context("failed to open websocket stream")?;
 
-        let (mut sender, mut receiver) = stream.split();
+        let (mut ws_sender, mut ws_receiver) = stream.split();
 
-        // spawn the thread for receiving messages from the webscoket, and sending them over the res_sender broadcast channel
+        // receive messages from the ws receiver, and send them over broadcast sender
+        let cancel = client.cancel.clone();
         tokio::spawn(async move {
             loop {
-                let msg = receiver.next().await;
-                if let Some(msg) = msg {
-                    if let Err(e) = &msg {
-                        eprintln!("got error message over websocket - \n {e:?}")
-                    }
-
-                    let msg = msg.unwrap();
-                    match msg {
-                        Message::Text(msg) => {
-                            let send_res = res_sender.send(msg.to_string());
-                            if let Err(e) = send_res {
-                                eprintln!(
-                                    "error sending websocket response over mpsc channel - \n {e:?}"
-                                )
+                tokio::select! {
+                    msg = ws_receiver.next() => {
+                        match msg {
+                            Some(msg) => match msg {
+                                Ok(msg) => match msg {
+                                    Message::Text(msg) => {
+                                        let send_res = receiver_out.send(msg);
+                                        if let Err(e) = send_res {
+                                            eprintln!("error sending websocket response over mpsc channel - \n {e:?}")
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                Err(e) => {
+                                    eprintln!("got error message over websocket - \n {e:?}");
+                                    cancel.cancel();
+                                }
+                            },
+                            None => {
+                                eprintln!("got none message over websocket");
+                                cancel.cancel();
                             }
-                        }
-                        _ => {}
+                        };
+                    }
+                    _ = time::sleep(Duration::from_secs(15)) => {
+                        eprintln!("socket timed out");
+                        cancel.cancel();
+                }
+                    _ = cancel.cancelled() => {
+                        break;
                     }
                 }
             }
         });
 
-        // spawn the thread for receiving messages from the mpsc channel, and sending them over the websocket sender, or pinging once every five seconds›
+        // receive message from the mpsc receiver, send them over ws sender, or ping once every five seconds.
+        let cancel = client.cancel.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    msg = req_receiver.recv() => {
-                        if let Some(msg) = msg {
-                            let send_res = sender.send(Message::Text(msg)).await;
-                            if let Err(e) = send_res {
-                                eprintln!("error sending request message - \n {e:?}");
+                    msg = sender_in.recv() => {
+                        match msg {
+                            Some(msg) => {
+                                let res = ws_sender.send(Message::Text(msg)).await;
+                                match res {
+                                    Ok(()) => {}
+                                    Err(e) => {
+                                        eprintln!("error sending request message - \n {e:?}");
+                                        cancel.cancel();
+                                    }
+                                }
                             }
+                            None =>{}
                         }
                     }
                     _ = time::sleep(Duration::from_secs(5)) => {
-                            let ping_res = sender.send(Message::Ping(Vec::new())).await;
+                            let ping_res = ws_sender.send(Message::Ping(Vec::new())).await;
                             if let Err(e) = ping_res {
                                 eprintln!("failed to ping socket - \n {e}");
+                                cancel.cancel();
                             }
+                    }
+                    _ = cancel.cancelled() => {
+                        break;
                     }
                 }
             }
@@ -89,84 +113,92 @@ impl XrplSocket {
         Ok(client)
     }
 
-    pub async fn request<T: Clone + Send + Debug + Serialize + DeserializeOwned + 'static>(
-        &self,
-        req: XrplRequest,
-    ) -> anyhow::Result<XrplResponse<T>> {
-        let sender = self.req_sender.clone();
-        let mut receiver = self.res_receiver.resubscribe();
-        let (out_sender, out_rec) = oneshot::channel::<XrplResponse<T>>();
+    pub async fn request(&self, request: Value) -> anyhow::Result<String> {
+        let cancel = self.cancel.clone();
+
+        let mut ws_receiver = self.receiver.resubscribe();
+        let (out_sender, out_rec) = oneshot::channel::<String>();
+
+        let send_res = self.sender.send(request.to_string()).await;
+        if let Err(e) = send_res {
+            return Err(anyhow!(e));
+        }
 
         tokio::spawn(async move {
-            let req_id = Uuid::new_v4().to_string();
-            let req = req.to_string(&req_id);
-            let send_res = sender.send(req).await;
-            if let Err(e) = send_res {
-                eprintln!("error sending request - \n {e:?}");
-            }
+            let req = request.as_object().unwrap();
+            let req_id = req.get("id").unwrap();
+
             loop {
-                let msg = receiver.recv().await;
-                if let Err(e) = msg {
-                    eprintln!("got error message from broadcast receiver - \n {e:?}");
-                    continue;
-                }
-                let msg = msg.unwrap();
-                let response = serde_json::from_str::<XrplResponse<T>>(&msg);
-
-                if let Err(_) = &response {
-                    continue;
-                }
-
-                let response = response.unwrap();
-                let id = &response.id;
-                if &req_id == id {
-                    let res = out_sender.send(response);
-                    if let Err(e) = res {
-                        eprintln!("error sending message on out channel - \n {e:?}");
-                    }
+                if cancel.is_cancelled() {
                     break;
                 }
+                match ws_receiver.recv().await {
+                    Ok(msg) => {
+                        let response = serde_json::from_str::<Value>(&msg);
+                        match response {
+                            Ok(response) => {
+                                let id = response.as_object().unwrap().get("id").unwrap();
+                                if req_id == id {
+                                    out_sender.send(response.to_string()).unwrap();
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{e}");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        break;
+                    }
+                }
             }
         });
 
-        out_rec
-            .await
-            .context("failed to get response msg from out channel")
+        tokio::select! {
+            res = out_rec => res.context("failed to get message from out sender"),
+            _ = tokio::time::sleep(Duration::from_millis(self.timeout_dur.unwrap_or(5000) as u64)) => Err(anyhow!("request timed out"))
+        }
     }
 
-    pub async fn subscribe<T: Clone + Send + Debug + Serialize + DeserializeOwned + 'static>(
-        &self,
-        req: XrplSubscriptionRequest,
-    ) -> anyhow::Result<Receiver<T>> {
-        let sender = self.req_sender.clone();
-        let mut receiver = self.res_receiver.resubscribe();
-        let (res_sender, res_receiver) = broadcast::channel::<T>(10);
+    pub async fn subscribe<T: XrplSubscription>(&self) -> broadcast::Receiver<T::Message> {
+        let cancel = self.cancel.clone();
+        let mut ws_receiver = self.receiver.resubscribe();
+
+        let (sender, receiver) = broadcast::channel::<T::Message>(100);
 
         tokio::spawn(async move {
-            let send_res = sender.send(req.to_string()).await;
-            if let Err(e) = send_res {
-                eprintln!("error sending request - \n {e:?}");
-            }
             loop {
-                let msg = receiver.recv().await;
-                if let Err(e) = msg {
-                    eprintln!("got error message from broadcast receiver - \n {e:?}");
-                    continue;
+                if cancel.is_cancelled() {
+                    break;
                 }
-
-                let msg = msg.unwrap();
-                let serialized = serde_json::from_str::<T>(&msg);
-                if let Err(_) = serialized {
-                    continue;
-                }
-
-                let send_res = res_sender.send(serialized.unwrap());
-                if let Err(e) = send_res {
-                    eprintln!("error sending subscription message out of thread - \n {e:?}")
+                match ws_receiver.recv().await {
+                    Ok(msg) => {
+                        let parsed = serde_json::from_str::<T::Message>(&msg);
+                        match parsed {
+                            Ok(parsed) => {
+                                let res = sender.send(parsed);
+                                if let Err(e) = res {
+                                    eprintln!("{e}");
+                                    break;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("{e}");
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        break;
+                    }
                 }
             }
         });
 
-        Ok(res_receiver)
+        receiver
     }
 }
